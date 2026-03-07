@@ -1,0 +1,1 @@
+create_clock -name clk_200m -period 7 [get_ports clk]
