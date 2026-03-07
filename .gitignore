@@ -1,0 +1,13 @@
+# Vivado generated files
+*.dcp
+*.jou
+*.log
+*.str
+*.bit
+*.ltx
+*.xpr
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
