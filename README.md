@@ -1,535 +1,527 @@
-# Multi-Precision Tensor Compute Unit — TPU Design
+# Multi-Precision Tensor Compute Unit — FPGA-Based TPU Design
 
-> **第九届（2025）全国大学生集成电路创新创业大赛 · 中科芯杯 · 华南分赛区二等奖**
+> **2nd Prize, South China Regional Final — 9th National Undergraduate Integrated Circuit Innovation & Entrepreneurship Competition (CICC 2025), Zhongke Xin Cup**
 
-**[English Version (README_EN.md)](README_EN.md)**
+**[中文版 (README_CN.md)](README_CN.md)**
 
-基于 FPGA 的多精度张量计算单元（TPU）设计，面向 AI 推理场景的异构加速架构。核心实现 8×8 脉动阵列（Systolic Array），支持 INT4/INT8/INT32/FP16/FP32/FP64/BF16 共 **7 种数据精度**的矩阵乘累加（GEMM）运算，并通过 Bitmap 稀疏编码 + 结构化剪枝 + Tile-wise 分块实现零值跳过加速，在 Xilinx VCU118 平台上达到 **214.6 MHz** 综合频率，理论算力 **27.47 GOPS**。
+An FPGA-based multi-precision Tensor Processing Unit (TPU) targeting AI inference acceleration through heterogeneous computing. The design features an 8×8 systolic array with 5-stage pipelined MACs, supporting **7 data precisions** (INT4/INT8/INT32/FP16/FP32/FP64/BF16) and **3 mixed-precision modes**. Sparse matrix acceleration via Bitmap encoding, structured pruning, and tile-wise sparsity achieves significant compute and power savings. Synthesized at **214.6 MHz** on Xilinx VCU118 with a peak throughput of **27.47 GOPS**.
 
-### 核心 GEMM 运算
+## Core GEMM Operation
 
-对于 $M \times K$ 矩阵 $A$、$K \times N$ 矩阵 $B$、偏置矩阵 $C$，输出矩阵 $D$ 的每个元素计算如下：
+For an $M \times K$ matrix $A$, a $K \times N$ matrix $B$, and bias matrix $C$, each element of the output matrix $D$ is computed as:
 
 $$D_{ij} = \sum_{k=0}^{K-1} A_{ik} \cdot B_{kj} + C_{ij}, \quad i \in [0, M), \; j \in [0, N)$$
 
-本设计通过 8×8 脉动阵列对上述运算进行硬件映射，大矩阵经分块（Tiling）后以子块为单位送入阵列迭代计算。
+The 8×8 systolic array maps this operation to hardware. Larger matrices are decomposed into 8×8 tiles and processed iteratively via a `pe_counter`-controlled tiling mechanism.
 
 ---
 
-## 项目信息
+## Project Information
 
-| 项目 | 内容 |
-|------|------|
-| 赛题 | 中科芯杯——多精度张量计算单元设计 |
-| 参赛单位 | 华南理工大学 |
-| 指导老师 | 姚恩义 |
-| 参赛队员 | 朱妤婧、陈锦洋、王欣彤 |
-| 队伍编号 | CICC0900784 |
-| 目标平台 | Xilinx VCU118 (XCVU9P-L2FLGA2104E) |
-| 开发工具 | Vivado 2024.1 |
-| 设计语言 | SystemVerilog |
+| Item | Details |
+|------|---------|
+| Competition | Zhongke Xin Cup — Multi-Precision Tensor Compute Unit Design |
+| Institution | South China University of Technology (SCUT) |
+| Advisor | Prof. Enyi Yao |
+| Team | Yujing Zhu, Jinyang Chen, Xintong Wang |
+| Team ID | CICC0900784 |
+| Target Platform | Xilinx VCU118 (XCVU9P-L2FLGA2104E) |
+| EDA Tool | Vivado 2024.1 |
+| HDL | SystemVerilog |
 
 ---
 
-## 硬件架构总览
+## Architecture Overview
 
-> **高清架构图**：建议使用 [Draw.io](https://app.diagrams.net/) 或 Visio 将下方 ASCII 架构图导出为 SVG/PNG 彩色矢量图，便于在手机端和答辩场景阅读。可参考 `答辩材料/CICC0900784 中科芯杯 海报展示.png` 中的设计风格。
+> **Vector Diagram**: It is recommended to export the ASCII diagram below as an SVG/PNG using [Draw.io](https://app.diagrams.net/) or Visio for better readability on mobile devices and during presentations. See `答辩材料/CICC0900784 中科芯杯 海报展示.png` for design style reference.
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                    AI + FPGA 异构张量计算加速平台                                  │
-│                                                                                  │
-│  ┌─────────────┐    APB Bus     ┌──────────────────────────────────────────────┐  │
-│  │  Host CPU   │◄──────────────►│            APB Configuration                │  │
-│  │  (AI 框架)  │   precision    │  ┌─────────────────────────────────────┐    │  │
-│  │             │   matrix_mode  │  │ Control Registers                   │    │  │
-│  │  PyTorch /  │   mixed_mode   │  │  [2:0] precision_mode (7种精度)     │    │  │
-│  │  TensorFlow │   start        │  │  [3]   mixed_mode (混合精度)        │    │  │
-│  │             │                │  │  [5:4] matrix_mode (矩阵维度)       │    │  │
-│  └──────┬──────┘                │  │  [8]   start (启动信号)             │    │  │
-│         │                       │  └─────────────────────────────────────┘    │  │
-│         │ AXI4 Bus              └────────────────────┬───────────────────────┘  │
-│         │                                            │                          │
-│  ┌──────▼───────────────────────────────────────────────────────────────────┐   │
-│  │                         FPGA Tensor Compute Unit                         │   │
-│  │                                                                          │   │
-│  │  ┌──────────────┐     ┌──────────────┐     ┌─────────────────────────┐  │   │
-│  │  │  AXI Slave   │     │  Data_Load   │     │    Block RAM Storage    │  │   │
-│  │  │  Controller  │────►│   Module     │────►│  A[32][16] B[32][16]    │  │   │
-│  │  │  (数据接收)   │     │  (精度解析    │     │  C[16][16]             │  │   │
-│  │  │              │     │   稀疏编码)   │     │  36-bit Sparse Format  │  │   │
-│  │  └──────────────┘     └──────────────┘     └──────────┬──────────────┘  │   │
-│  │                                                       │                  │   │
-│  │  ┌────────────────────────────────────────────────────▼───────────────┐  │   │
-│  │  │                    FSM Controller (6-State)                        │  │   │
-│  │  │   IDLE ──► LOAD_C ──► LOAD_A ──► LOAD_B ──► COMPUTE ──► OUTPUT   │  │   │
-│  │  └────────────────────────────────────┬──────────────────────────────┘  │   │
-│  │                                       │                                 │   │
-│  │  ┌────────────────────────────────────▼──────────────────────────────┐  │   │
-│  │  │              8 × 8 Systolic PE Array (64 PEs)                     │  │   │
-│  │  │                                                                    │  │   │
-│  │  │    A ──►  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐│  │   │
-│  │  │    Row0   │PE00│→│PE01│→│PE02│→│PE03│→│PE04│→│PE05│→│PE06│→│PE07││  │   │
-│  │  │           └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘│  │   │
-│  │  │    A ──►  ┌─▼──┐ ┌─▼──┐ ┌─▼──┐ ┌─▼──┐ ┌─▼──┐ ┌─▼──┐ ┌─▼──┐ ┌─▼──┐│  │   │
-│  │  │    Row1   │PE10│→│PE11│→│PE12│→│PE13│→│PE14│→│PE15│→│PE16│→│PE17││  │   │
-│  │  │           └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘ └─┬──┘│  │   │
-│  │  │             ▼      ▼      ▼      ▼      ▼      ▼      ▼      ▼   │  │   │
-│  │  │           ... (8 rows × 8 cols, 共 64 个 PE) ...                  │  │   │
-│  │  │                                                                    │  │   │
-│  │  │   ┌─────────────────────────────────────────────────────────────┐  │  │   │
-│  │  │   │  Each PE: 5-Stage Pipelined MAC                            │  │   │
-│  │  │   │                                                             │  │   │
-│  │  │   │  Stage 1: Operand Fetch & Precision Decode                 │  │   │
-│  │  │   │  Stage 2: Multiply (INT4/INT8/FP16/BF16/FP32 共享乘法器)   │  │   │
-│  │  │   │  Stage 3: Alignment (浮点对阶 / 整数符号扩展)               │  │   │
-│  │  │   │  Stage 4: Accumulate (D = A×B + C_partial)                 │  │   │
-│  │  │   │  Stage 5: Normalize & Output (浮点规格化 / 整数饱和)        │  │   │
-│  │  │   │                                                             │  │   │
-│  │  │   │  Sparse Skip: if bitmap[i]==0 → bypass multiply, latency=0│  │   │
-│  │  │   └─────────────────────────────────────────────────────────────┘  │  │   │
-│  │  └────────────────────────────────────────────────────────────────────┘  │   │
-│  │                                       │                                 │   │
-│  │  ┌────────────────────────────────────▼──────────────────────────────┐  │   │
-│  │  │  AXI Master Controller ──► 64-bit Output (packed 2×32-bit)       │  │   │
-│  │  │  d_out_buffer[8][8] → Host Memory / 下游推理加速器               │  │   │
-│  │  └──────────────────────────────────────────────────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────────┐   │
-│  │  Sparse Acceleration Variants (三种稀疏加速模式可切换)                     │   │
-│  │                                                                          │   │
-│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐  │   │
-│  │  │ Basic Sparse     │  │ Structured       │  │ Tile-Wise Sparse    │  │   │
-│  │  │ (Bitmap 逐元素)  │  │ Pruning          │  │ (4×4 子块级)         │  │   │
-│  │  │                  │  │ (行/列级剪枝)     │  │                      │  │   │
-│  │  │ 50%稀疏→1.8×加速 │  │ 整行/列跳过      │  │ 细粒度子块稀疏跳过    │  │   │
-│  │  └──────────────────┘  └──────────────────┘  └──────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                AI + FPGA Heterogeneous Tensor Acceleration Platform            │
+│                                                                                │
+│  ┌─────────────┐    APB Bus     ┌────────────────────────────────────────┐    │
+│  │  Host CPU   │◄──────────────►│         APB Configuration             │    │
+│  │  (AI Fwk)   │  precision     │  [2:0] precision_mode (7 precisions)  │    │
+│  │  PyTorch /  │  matrix_mode   │  [3]   mixed_mode                     │    │
+│  │  TensorFlow │  start         │  [5:4] matrix_mode (3 dimensions)     │    │
+│  └──────┬──────┘                │  [8]   start                          │    │
+│         │                       └──────────────────┬─────────────────────┘    │
+│         │ AXI4                                     │                          │
+│  ┌──────▼─────────────────────────────────────────────────────────────────┐   │
+│  │                      FPGA Tensor Compute Unit                          │   │
+│  │                                                                        │   │
+│  │  ┌────────────┐   ┌────────────┐   ┌────────────────────────────┐    │   │
+│  │  │ AXI Slave  │──►│ Data_Load  │──►│  Block RAM (36-bit Sparse) │    │   │
+│  │  │ Controller │   │ (Precision │   │  A[32][16]  B[32][16]      │    │   │
+│  │  │            │   │  Decode)   │   │  C[16][16]                 │    │   │
+│  │  └────────────┘   └────────────┘   └──────────┬─────────────────┘    │   │
+│  │                                               │                       │   │
+│  │  ┌────────────────────────────────────────────▼────────────────────┐  │   │
+│  │  │              FSM Controller (6-State)                           │  │   │
+│  │  │  IDLE → LOAD_C → LOAD_A → LOAD_B → COMPUTE → OUTPUT           │  │   │
+│  │  └─────────────────────────────┬──────────────────────────────────┘  │   │
+│  │                                │                                     │   │
+│  │  ┌─────────────────────────────▼──────────────────────────────────┐  │   │
+│  │  │          8 × 8 Systolic PE Array (64 PEs)                      │  │   │
+│  │  │                                                                 │  │   │
+│  │  │  A→ [PE00]→[PE01]→[PE02]→[PE03]→[PE04]→[PE05]→[PE06]→[PE07]  │  │   │
+│  │  │       ↓      ↓      ↓      ↓      ↓      ↓      ↓      ↓     │  │   │
+│  │  │  A→ [PE10]→[PE11]→[PE12]→[PE13]→[PE14]→[PE15]→[PE16]→[PE17]  │  │   │
+│  │  │       ↓      ↓      ↓      ↓      ↓      ↓      ↓      ↓     │  │   │
+│  │  │      ...   ...    ...    ...    ...    ...    ...    ...        │  │   │
+│  │  │  A→ [PE70]→[PE71]→[PE72]→[PE73]→[PE74]→[PE75]→[PE76]→[PE77]  │  │   │
+│  │  │       ↑B     ↑B     ↑B     ↑B     ↑B     ↑B     ↑B     ↑B    │  │   │
+│  │  │                                                                 │  │   │
+│  │  │  Each PE: 5-Stage Pipeline                                      │  │   │
+│  │  │  S1:Fetch → S2:Multiply → S3:Align → S4:Accumulate → S5:Norm   │  │   │
+│  │  │  Sparse: bitmap==0 → bypass multiply (zero-latency)            │  │   │
+│  │  └─────────────────────────────┬──────────────────────────────────┘  │   │
+│  │                                │                                     │   │
+│  │  ┌─────────────────────────────▼──────────────────────────────────┐  │   │
+│  │  │  AXI Master Controller → 64-bit Output (packed 2×32-bit)       │  │   │
+│  │  └────────────────────────────────────────────────────────────────┘  │   │
+│  └────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐   │
+│  │  Sparse Acceleration (3 Switchable Modes)                              │   │
+│  │  ┌────────────────┐ ┌──────────────────┐ ┌────────────────────────┐  │   │
+│  │  │ Basic Sparse   │ │ Structured       │ │ Tile-Wise Sparse      │  │   │
+│  │  │ (Element-wise) │ │ Pruning          │ │ (4×4 Sub-tile)        │  │   │
+│  │  │                │ │ (Row/Col-level)  │ │                        │  │   │
+│  │  └────────────────┘ └──────────────────┘ └────────────────────────┘  │   │
+│  └────────────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 核心技术详解
+## Key Technical Details
 
-### 1. 多精度支持：FP32 到 INT4 的硬件复用
+### 1. Multi-Precision Support: FP32-to-INT4 Hardware Reuse
 
-#### 精度模式一览
+#### Supported Precisions
 
-| 精度模式 | 编码 `precision_mode` | 输入位宽 | 累加器位宽 | 每32-bit字可装填元素数 | 数据格式 |
-|----------|----------------------|---------|-----------|---------------------|---------|
-| INT4     | `3'b000`             | 4-bit   | 64-bit    | 8 个                | 有符号定点 |
-| INT8     | `3'b001`             | 8-bit   | 64-bit    | 4 个                | 有符号定点 |
-| INT32    | —                    | 32-bit  | 32-bit    | 1 个                | 有符号整数 |
-| FP16     | `3'b010`             | 16-bit  | 16-bit    | 2 个                | IEEE 754 半精度 |
-| FP32     | `3'b011`             | 32-bit  | 32-bit    | 1 个                | IEEE 754 单精度 |
-| FP64     | —                    | 64-bit  | 64-bit    | —                   | IEEE 754 双精度 |
-| BF16     | `3'b100`             | 16-bit  | 16-bit    | 2 个                | Brain Floating Point |
+| Precision | `precision_mode` | Input Width | Accumulator | Elements/Word | Format |
+|-----------|-----------------|-------------|-------------|---------------|--------|
+| INT4 | `3'b000` | 4-bit | 64-bit | 8 | Signed fixed-point |
+| INT8 | `3'b001` | 8-bit | 64-bit | 4 | Signed fixed-point |
+| INT32 | `3'b101` | 32-bit | 32-bit | 1 | Signed integer |
+| FP16 | `3'b010` | 16-bit | 16-bit | 2 | IEEE 754 half-precision |
+| FP32 | `3'b011` | 32-bit | 32-bit | 1 | IEEE 754 single-precision |
+| FP64 | — | 64-bit | 64-bit | — | IEEE 754 double-precision |
+| BF16 | `3'b100` | 16-bit | 16-bit | 2 | Brain Floating Point |
 
-此外支持 **3 种混合精度计算模式**，PE 多精度共用乘加法器，FP16、FP32 共用浮点乘法单元：
+Three **mixed-precision modes** are supported, with PE multipliers shared across precisions (FP16/FP32 reuse the same floating-point multiply unit):
 
-| 混合模式 | 输入精度 | 累加精度 | 适用场景 |
-|---------|---------|---------|---------|
-| INT4/INT8 + INT32 | 4/8-bit 整数 | 32-bit 整数 | 低位宽量化推理，防止累加溢出 |
-| FP16 + FP32 + FP64 | 16-bit 浮点 | 32/64-bit 浮点 | 高精度浮点训练/推理 |
-| BF16 + FP32 | 16-bit BF16 | 32-bit 浮点 | 大动态范围 AI 推理 |
+| Mixed Mode | Input Precision | Accumulator | Application |
+|-----------|----------------|-------------|-------------|
+| INT4/INT8 + INT32 | 4/8-bit int | 32-bit int | Quantized inference (overflow prevention) |
+| FP16 + FP32 + FP64 | 16-bit float | 32/64-bit float | High-precision training/inference |
+| BF16 + FP32 | 16-bit BF16 | 32-bit float | Large dynamic range AI inference |
 
-> **参考标准**：浮点运算遵循 **IEEE 754-2019** 标准 [1]，实现完整的 Round-to-Nearest-Even 舍入策略、NaN/Inf 传播、非规格数（Denormal）处理及溢出检测。BF16 格式参考 Google Brain 的 **Brain Floating Point** 定义 [2]，与 NVIDIA Tensor Core 第三代（Ampere 架构）的精度配置对齐 [3]。混合精度策略借鉴 NVIDIA Mixed-Precision Training 方法论 [4]。
+> **Standards Compliance**: Floating-point operations conform to **IEEE 754-2019** [1] with full Round-to-Nearest-Even rounding, NaN/Inf propagation, denormal number handling, and overflow/underflow detection. BF16 follows Google Brain's **Brain Floating Point** specification [2], aligned with NVIDIA Tensor Core 3rd-generation (Ampere) precision definitions [3]. The mixed-precision strategy draws from NVIDIA's Mixed-Precision Training methodology [4].
 
-#### 硬件复用机制（关键设计）
+#### Hardware Reuse Mechanism
 
-多精度切换的核心在于**统一 36-bit 数据通路 + 精度感知的运算函数选择**。
+The key design principle is a **unified 36-bit datapath with precision-aware function dispatch**.
 
-**浮点运算核心公式**（遵循 IEEE 754-2019 [1]）：
+**Core floating-point formulas** (per IEEE 754-2019 [1]):
 
-- **FP32 乘法**：$(-1)^{s_a \oplus s_b} \times 2^{(e_a + e_b - 127)} \times (1.m_a \times 1.m_b)$，24×24 位尾数相乘后进行 Round-to-Nearest-Even 舍入
-- **FP16→FP32 提升**：$e_{\text{FP32}} = e_{\text{FP16}} + 112$（偏移量差 $127 - 15 = 112$），非规格数通过前导零计数归一化
-- **BF16→FP32 提升**：高 16 位直接映射（$\text{BF16} \equiv \text{FP32}[31:16]$，低 16 位补零）
-- **整数溢出检测**：$\text{overflow} = (A[63] = B[63]) \wedge (A[63] \neq \text{Result}[63])$（同符号输入异符号输出）
+- **FP32 Multiply**: $(-1)^{s_a \oplus s_b} \times 2^{(e_a + e_b - 127)} \times (1.m_a \times 1.m_b)$ — 24×24-bit significand product with Round-to-Nearest-Even
+- **FP16→FP32 Promotion**: $e_{\text{FP32}} = e_{\text{FP16}} + 112$ (bias delta: $127 - 15 = 112$); denormals via leading-zero count normalization
+- **BF16→FP32 Promotion**: Direct upper-16-bit mapping ($\text{BF16} \equiv \text{FP32}[31{:}16]$, lower 16 bits zero-padded)
+- **Integer Overflow Detection**: $\text{overflow} = (A[63] = B[63]) \wedge (A[63] \neq R[63])$ (same-sign inputs, opposite-sign result)
 
 ```
-               32-bit AXI 数据输入
+               32-bit AXI Data Input
                       │
           ┌───────────▼───────────┐
           │   Precision Decoder   │
           │   (safe_bit_select)   │
           │                       │
-          │  precision_mode=000   │──► 提取 8 个 4-bit 元素 → int4_mul()
-          │  precision_mode=001   │──► 提取 4 个 8-bit 元素 → int8_mul()
-          │  precision_mode=010   │──► 提取 2 个 16-bit 元素 → fp16→fp32 扩展 → fp32_mult()
-          │  precision_mode=011   │──► 直接使用 32-bit      → fp32_mult()
-          │  precision_mode=100   │──► 提取 2 个 16-bit 元素 → bf16→32bit 扩展 → bf16_mult()
+          │  mode=000 (INT4)      │──► Extract 8 × 4-bit  → int4_mul()
+          │  mode=001 (INT8)      │──► Extract 4 × 8-bit  → int8_mul()
+          │  mode=010 (FP16)      │──► Extract 2 × 16-bit → fp16→fp32 → fp32_mult()
+          │  mode=011 (FP32)      │──► Use 32-bit directly → fp32_mult()
+          │  mode=100 (BF16)      │──► Extract 2 × 16-bit → bf16→32bit → bf16_mult()
           └───────────────────────┘
                       │
           ┌───────────▼───────────┐
           │  36-bit Sparse Format │
-          │  [35:32] Bitmap Meta  │ ◄── 稀疏有效性标记
-          │  [31:0]  Data Value   │ ◄── 统一数据位宽
+          │  [35:32] Bitmap Meta  │ ← Validity flags
+          │  [31:0]  Data Payload │ ← Unified data width
           └───────────────────────┘
                       │
           ┌───────────▼───────────┐
           │  Shared MAC Datapath  │
           │  (5-Stage Pipeline)   │
           │                       │
-          │  乘法器: 根据 mode    │
-          │  复用同一组硬件资源    │
-          │  INT4/INT8 → 整数乘法 │
-          │  FP16/BF16 → 浮点乘法 │
-          │  FP32      → 浮点乘法 │
+          │  Multiplier: mode-    │
+          │  selected from shared │
+          │  hardware resources   │
+          │  (LUT-only, 0 DSP)   │
           │                       │
-          │  加法器: 同理复用      │
+          │  Adder: similarly     │
+          │  shared               │
           └───────────────────────┘
 ```
 
-**复用逻辑要点：**
+**Key reuse principles:**
 
-1. **数据装填复用**：同一 32-bit AXI 数据总线，根据精度模式装填不同数量的操作数——INT4 模式下单次传输携带 8 个元素，FP32 模式仅 1 个。`Data_Load` 模块通过 `elements_per_word` 参数动态调整解析逻辑。
+1. **Data packing reuse**: A single 32-bit AXI bus carries 8 INT4 elements, 4 INT8 elements, 2 FP16/BF16 elements, or 1 FP32 element. The `Data_Load` module dynamically adjusts via `elements_per_word`.
 
-2. **乘法器复用**：PE 内部通过 `precision_mode` 选择调用 `int4_mul()` / `int8_mul()` / `fp32_mult()` / `bf16_mult()` 等运算函数。各函数共享同一组寄存器流水线，仅在操作数提取和结果格式化阶段存在差异。综合时设置 `use_dsp = "no"`，所有乘法均由 LUT 实现，避免 DSP 资源绑定单一精度。
+2. **Multiplier reuse**: PEs select `int4_mul()` / `int8_mul()` / `fp32_mult()` / `bf16_mult()` based on `precision_mode`. All functions share the same pipeline register stages, differing only in operand extraction and result formatting. Synthesis attribute `use_dsp = "no"` forces **pure LUT implementation**, freeing all DSP48E2 blocks for other accelerators.
 
-3. **累加器复用**：整数模式使用 64-bit 宽累加器（支持大量 INT4 累加不溢出），浮点模式使用对应位宽的浮点加法器。累加器在 COMPUTE 阶段通过 `c_data` 初始化（即矩阵 C 的偏置值）。
+3. **Accumulator reuse**: Integer modes use 64-bit accumulators (preventing INT4 accumulation overflow); floating-point modes use precision-specific FP adders. Accumulators are initialized with matrix $C$ bias values during the COMPUTE phase.
 
-4. **运行时零开销切换**：精度切换通过 APB 总线写入 `precision_mode` 寄存器，在下一次 GEMM 启动前即生效，无需重新配置比特流或重启硬件。
+4. **Zero-overhead runtime switching**: Precision is changed by writing the `precision_mode` APB register — effective on the next GEMM launch with **no bitstream reconfiguration or hardware restart**.
 
 ---
 
-### 2. 稀疏矩阵加速：Bitmap 压缩格式
+### 2. Sparse Matrix Acceleration: Bitmap Encoding
 
-#### 稀疏 GEMM 数学表达
+#### Sparse GEMM Formulation
 
-在稀疏模式下，对矩阵 $A$ 的每个元素引入有效性掩码 $m_A$，GEMM 运算简化为：
+With sparsity masks $m_A$ and $m_B$ on matrices $A$ and $B$, the GEMM reduces to:
 
 $$D_{ij} = \sum_{k=0}^{K-1} m_{A}(i,k) \cdot m_{B}(k,j) \cdot A_{ik} \cdot B_{kj} + C_{ij}$$
 
-其中 $m_A(i,k), m_B(k,j) \in \{0, 1\}$ 为 Bitmap 掩码。当 $m_A(i,k)=0$ 或 $m_B(k,j)=0$ 时，对应乘法被跳过，PE 直接传递部分和，实现零延迟旁路。
+where $m_A(i,k), m_B(k,j) \in \{0, 1\}$ are bitmap masks. When either mask is 0, the corresponding multiply is bypassed with zero latency.
 
-#### 压缩格式设计
+#### Encoding Format
 
-本设计采用 **Bitmap（位图）稀疏编码格式**，而非传统的 CSR/CSC 格式。选择 Bitmap 的原因：
+The design adopts a **Bitmap sparse encoding** rather than traditional CSR/CSC. Rationale:
 
-- **硬件友好**：固定格式，无需复杂的指针解引用逻辑
-- **并行性好**：每个元素的有效性独立判断，适合脉动阵列并行处理
-- **面积开销小**：仅增加 4-bit 元数据，相比 CSR 的行指针+列索引开销极低
+- **Hardware-friendly**: Fixed format, no complex pointer dereferencing
+- **Parallelism**: Per-element validity is independently evaluated, ideal for systolic arrays
+- **Low overhead**: Only 4-bit metadata per element vs. CSR's row-pointer + column-index
 
 ```
 36-bit Sparse Data Format:
 ┌──────────────────────────────────────────┐
-│ [35:32]  Bitmap Metadata (4-bit)         │  ← 标记元素有效性
-│ [31:0]   Data Payload (32-bit)           │  ← 实际数值
+│ [35:32]  Bitmap Metadata (4-bit)         │  ← Element validity flags
+│ [31:0]   Data Payload (32-bit)           │  ← Actual numeric value
 └──────────────────────────────────────────┘
 
-Bitmap[i] = 1  →  该元素非零，参与乘累加运算
-Bitmap[i] = 0  →  该元素为零，PE 跳过乘法，直接传递部分和
+Bitmap[i] = 1  →  Non-zero: participates in MAC
+Bitmap[i] = 0  →  Zero: PE bypasses multiply, forwards partial sum
 ```
 
-#### 零值跳过机制
+In the sparse variant, each BRAM word is extended to **37 bits** (`[36:0]`): the upper 5 bits (`[36:32]`) store the **column/row index** for sparse element addressing. Per-row/column write pointers (`ptr_a0`–`ptr_a31`, `ptr_b0`–`ptr_b31`) implement compressed storage where only non-zero elements occupy memory.
+
+#### Zero-Skip Mechanism
 
 ```systemverilog
-// PE 内部稀疏跳过伪代码
-if (bitmap_a[i] == 0 || bitmap_b[j] == 0) begin
-    // 跳过乘法运算，直接传递累加值
-    partial_sum <= partial_sum;  // bypass, 零延迟
+// PE sparse bypass (simplified)
+if (a_preprocessed == 0 || b_preprocessed == 0) begin
+    int_product  <= 0;
+    fp32_product <= 0;
+    bf16_product <= 0;  // bypass multiply — zero latency
 end else begin
-    // 正常执行 MAC
-    partial_sum <= partial_sum + a[i] * b[j];
+    // execute MAC per precision_mode
+    int_product  <= int4_mul(a, b) | int8_mul(a, b);
+    fp32_product <= fp32_mult(a, b);
+    bf16_product <= bf16_mult(a, b);
 end
 ```
 
-#### 三种稀疏加速模式
+#### Three Sparse Acceleration Modes
 
-| 模式 | 模块名 | 稀疏粒度 | 适用场景 | 加速比 (50% 稀疏度) |
-|------|--------|---------|---------|---------------------|
-| Basic Sparse | `TOP_TPU_Sparse_Matrix` | 逐元素 (Element-wise) | 通用非结构化稀疏 | ~1.8× |
-| Structured Pruning | `Pruning_Sparse_Matrix` | 行/列级 (Row/Column) | 剪枝后的 DNN 权重 | ~2.0× |
-| Tile-Wise Sparse | `Tile_Wise_Sparse_Matrix` | 4×4 子块级 (Sub-tile) | 块稀疏 Transformer | ~1.9× |
+| Mode | Module | Granularity | Application | Speedup (50% sparsity) |
+|------|--------|------------|-------------|------------------------|
+| Basic Sparse | `TOP_TPU_Sparse_Matrix` | Element-wise | General unstructured sparsity | ~1.8× |
+| Structured Pruning | `Pruning_Sparse_Matrix` | Row/Column-level | Pruned DNN weights | ~2.0× |
+| Tile-Wise Sparse | `Tile_Wise_Sparse_Matrix` | 4×4 Sub-tile | Block-sparse Transformers | ~1.9× |
 
-**加速比分析**：
+#### Speedup Analysis
 
-理论加速比由稀疏度 $S$（零元素占比）决定：
+Theoretical speedup is determined by sparsity ratio $S$ (fraction of zero elements):
 
 $$\text{Speedup}_{\text{ideal}} = \frac{1}{1-S}$$
 
-实际加速比受 Amdahl 定律约束——数据加载和 FSM 控制阶段不可并行化：
+Actual speedup is bounded by Amdahl's Law — data loading and FSM control are non-parallelizable:
 
 $$\text{Speedup}_{\text{actual}} = \frac{T_{\text{load}} + T_{\text{compute}}}{T_{\text{load}} + (1-S) \cdot T_{\text{compute}}}$$
 
-其中 $T_{\text{load}} = M \cdot N + M \cdot K + K \cdot N$ cycles（加载 C/A/B 矩阵），$T_{\text{compute}} = K + 27$ cycles（含流水线排空）。对于 16×16×16 矩阵：
+where $T_{\text{load}} = M \cdot N + M \cdot K + K \cdot N$ cycles (loading C/A/B), $T_{\text{compute}} = K + 27$ cycles (including pipeline flush). For a 16×16×16 matrix:
 
-| 稀疏度 $S$ | 理论加速比 | 实测加速比 | 效率 |
-|-----------|----------|----------|------|
+| Sparsity $S$ | Theoretical | Measured | Efficiency |
+|-------------|-------------|----------|------------|
 | 50% | 2.0× | ~1.8× | 90% |
 | 75% | 4.0× | ~3.2× | 80% |
 
 ---
 
-### 3. 脉动阵列 (Systolic Array)：资源与性能
+### 3. Systolic Array: Resources & Performance
 
-#### 8×8 阵列规格
+#### 8×8 Array Specifications
 
-| 指标 | 数值 | 说明 |
-|------|------|------|
-| PE 数量 | 64 (8×8) | 二维权重固定 (Weight Stationary) 脉动阵列 |
-| 流水线深度 | 5 级 / PE | Fetch → Multiply → Align → Accumulate → Normalize |
-| 计算延迟 | K+27 cycles | K 为矩阵缩减维度，27 为流水线填充+排空 |
-| 峰值吞吐量 | 64 MAC/cycle | INT4 模式下等效 512 INT4-MAC/cycle (8元素/字) |
-| 数据流模式 | 输出固定 (Output Stationary) | A 水平流动，B 垂直流动，部分和向下传递 |
+| Metric | Value | Notes |
+|--------|-------|-------|
+| PE Count | 64 (8×8) | 2D output-stationary systolic array |
+| Pipeline Depth | 5 stages/PE | Fetch → Multiply → Align → Accumulate → Normalize |
+| Compute Latency | $K + P_R + P_C - 1 + 4$ cycles | K=reduction dim, $P_R$/$P_C$=8 (array dims), 4=pipeline overhead |
+| Peak Throughput | 64 MAC/cycle | Equiv. 512 INT4-MAC/cycle (8 elements/word) |
+| Data Flow | Output Stationary | A flows horizontally, B flows vertically |
 
-#### FPGA 资源消耗（Xilinx XCVU9P 实测综合结果）
+#### FPGA Resource Utilization (Xilinx XCVU9P — Post-Implementation)
 
-| 资源类型 | 使用量 | 可用量 | 利用率 | 说明 |
-|----------|--------|--------|--------|------|
-| LUT | 92,722 | 1,182,240 | **7.84%** | 含多精度乘法器、加法器、控制逻辑 |
-| FF (触发器) | 46,307 | 2,364,480 | **1.96%** | 5级流水线寄存器、FSM状态寄存器 |
-| DSP48E2 | 0 | 6,840 | **0%** | 设计约束 `use_dsp = "no"`，纯 LUT 实现 |
-| IO | 187 | 832 | **22.48%** | AXI + APB 接口信号 |
+| Resource | Used | Available | Utilization | Notes |
+|----------|------|-----------|-------------|-------|
+| LUT | 92,722 | 1,182,240 | **7.84%** | Multi-precision multipliers, adders, control |
+| FF | 46,307 | 2,364,480 | **1.96%** | Pipeline registers, FSM state |
+| DSP48E2 | **0** | 6,840 | **0%** | `use_dsp = "no"` — pure LUT arithmetic |
+| IO | 187 | 832 | **22.48%** | AXI4 + APB interface signals |
 
-> **设计决策**：刻意不使用 DSP Slice，全部由 LUT 实现乘法运算。优势在于 DSP 资源可留给其他加速模块（如卷积引擎），实现异构计算资源的灵活分配。
+> **Design Decision**: DSP slices are intentionally unused. All arithmetic is implemented in LUT fabric, leaving DSP resources available for co-located accelerators (e.g., convolution engines) in heterogeneous SoC designs.
 
-#### 时序性能
+#### Timing
 
-| 时序指标 | 数值 |
-|----------|------|
+| Metric | Value |
+|--------|-------|
 | Fmax (Post-Implementation) | **214.6 MHz** |
-| WNS (Worst Negative Slack) | **0.34 ns** (时序收敛) |
+| WNS (Worst Negative Slack) | **0.34 ns** (timing closure achieved) |
 | TNS (Total Negative Slack) | 0 ns |
 | Failing Endpoints | 0 / 35,927 |
-| 关键路径 | FP32 乘法器 → 对阶加法器 (Stage 2→3) |
-| 计算延迟 | **163.1 ns** (单次 GEMM) |
+| Critical Path | FP32 multiplier → alignment adder (Stage 2→3) |
+| GEMM Latency | **163.1 ns** (single tile) |
 
-#### 功耗分析
+#### Power Analysis
 
-| 功耗项 | 数值 | 占比 |
-|--------|------|------|
-| **总功耗** | **3.663 W** | 100% |
-| 动态功耗 | 1.177 W | 32% |
+| Component | Power | Share |
+|-----------|-------|-------|
+| **Total On-Chip** | **3.663 W** | 100% |
+| Dynamic | 1.177 W | 32% |
 | — Clocks | 0.130 W | 11% |
 | — Signals | 0.474 W | 40% |
 | — Logic | 0.531 W | 45% |
 | — I/O | 0.041 W | 4% |
-| 静态功耗 | 2.486 W | 68% |
+| Static | 2.486 W | 68% |
 
-**稀疏模式功耗优化**：
+**Sparse Mode Power Optimization:**
 
-| 配置 | Fmax | LUT 利用率 | 功耗 | 动态功耗变化 |
-|------|------|-----------|------|-------------|
-| 密集模式 (Baseline) | 214.6 MHz | 8% | 3.663 W | — |
-| 4:2 结构化稀疏 | 206.53 MHz | 7% | 2.798 W | 动态功耗降至 **1/4** |
-| Tile-wise + 剪枝 + BF16量化 | — | — | — | 动态功耗降至 **0.276 W** |
+| Configuration | Fmax | LUT | Power | Dynamic Power |
+|--------------|------|-----|-------|---------------|
+| Dense (Baseline) | 214.6 MHz | 8% | 3.663 W | 1.177 W |
+| 4:2 Structured Sparse | 206.53 MHz | 7% | 2.798 W | **reduced to 1/4** |
+| Tile-wise + Pruning + BF16 Quant. | — | — | — | **down to 0.276 W** |
 
-#### 性能指标汇总
+#### Performance Summary
 
-| 指标 | 数值 |
-|------|------|
-| 理论算力 | **27.47 GOPS** |
-| 实际算力 (仿真实测) | **12.3 GOPS** |
-| 存储带宽 | **3.2 GB/s** |
-| 理论能效比 | **7.50 GOPS/W** |
-| 仿真能效比 | **3.36 GOPS/W** |
-| 计算延迟 | **163.1 ns** |
-
----
-
-### 4. 总线接口规格
-
-| 接口 | 协议 | 数据宽度 | 地址宽度 | 功能 |
-|------|------|---------|---------|------|
-| 数据输入 | AXI4 Slave | 32-bit | 32-bit | 接收矩阵 A/B/C 数据 |
-| 结果输出 | AXI4 Master | 64-bit | 32-bit | 写回计算结果 D（双字打包） |
-| 配置控制 | APB | 9-bit | - | 精度/维度/模式/启动控制 |
-
-**AXI Slave 内存映射**：通过 `mem_sel[1:0]` 选择写入目标
-
-| mem_sel | 目标 | 说明 |
-|---------|------|------|
-| `2'b00` | Matrix A | 输入矩阵 A（最大 32×16） |
-| `2'b01` | Matrix B | 输入矩阵 B（最大 16×32） |
-| `2'b10` | Matrix C | 偏置矩阵 C（最大 16×16） |
+| Metric | Value |
+|--------|-------|
+| Theoretical Throughput | **27.47 GOPS** |
+| Simulated Throughput | **12.3 GOPS** |
+| Memory Bandwidth | **3.2 GB/s** |
+| Theoretical Energy Efficiency | **7.50 GOPS/W** |
+| Simulated Energy Efficiency | **3.36 GOPS/W** |
+| GEMM Latency | **163.1 ns** |
 
 ---
 
-### 5. 矩阵维度配置
+### 4. Bus Interfaces
 
-支持三种 M×N×K 矩阵模式，通过 APB 的 `matrix_mode` 寄存器切换：
+| Interface | Protocol | Data Width | Addr Width | Function |
+|-----------|----------|-----------|------------|----------|
+| Data Input | AXI4 Slave | 32-bit | 32-bit | Receive matrices A/B/C |
+| Result Output | AXI4 Master | 64-bit | 32-bit | Write back result D (dual-word packed) |
+| Configuration | APB | 9-bit | — | Precision/dimension/mode/start control |
 
-| 模式 | 维度 | 等效分块策略 | 适用场景 |
-|------|------|------------|---------|
-| `m8n32k16` | 8×32×16 | 宽输出矩阵 | FC 层（少输入、多输出神经元） |
-| `m16n16k16` | 16×16×16 | 方阵平衡 | 通用 GEMM |
-| `m32n8k16` | 32×8×16 | 高输入矩阵 | Batch 推理（大 batch、少类别） |
+**AXI Slave Memory Map** (via `mem_sel[1:0]`):
 
-最大维度：M=32, N=32, K=16。大矩阵通过分块（Tiling）+ 多次 `pe_counter` 迭代覆盖。
+| `mem_sel` | Target | Size |
+|-----------|--------|------|
+| `2'b00` | Matrix A | up to 32×16 |
+| `2'b01` | Matrix B | up to 16×32 |
+| `2'b10` | Matrix C | up to 16×16 |
+
+### 5. Matrix Dimension Configurations
+
+| Mode | Dimensions | Tiling Strategy | Application |
+|------|-----------|----------------|-------------|
+| `m8n32k16` | 8×32×16 | 1×4 (wide output) | FC layers (few inputs, many outputs) |
+| `m16n16k16` | 16×16×16 | 2×2 (balanced) | General GEMM |
+| `m32n8k16` | 32×8×16 | 4×1 (tall input) | Batch inference (large batch, few classes) |
+
+Maximum dimensions: M=32, N=32, K=16. Larger matrices are tiled via 4 `pe_counter` iterations.
 
 ---
 
-## FSM 控制流
+## FSM Control Flow
 
 ```
-┌───────┐   start    ┌────────┐  m×n cycles  ┌────────┐  m×k cycles  ┌────────┐
+┌───────┐   start    ┌────────┐  M·N cycles  ┌────────┐  M·K cycles  ┌────────┐
 │ IDLE  │──────────►│ LOAD_C │────────────►│ LOAD_A │────────────►│ LOAD_B │
 └───────┘           └────────┘             └────────┘             └────┬───┘
     ▲                                                                  │
-    │                                                            k×n cycles
+    │                                                            K·N cycles
     │               ┌────────┐  64 cycles   ┌─────────┐               │
     └───────────────│ OUTPUT │◄────────────│ COMPUTE │◄──────────────┘
       pe_counter    └────────┘  per tile    └─────────┘  K+27 cycles
-      迭代完成                                (含流水线排空)
+      done (=4)                              (incl. pipeline flush)
 ```
 
 ---
 
-## 目录结构
+## Comparison with Related Work
+
+| Metric | **This Work** | NVDLA Small [5] | Xilinx DPU B1024 [6] | Gemmini [7] |
+|--------|---------------|-----------------|----------------------|-------------|
+| Platform | XCVU9P (VCU118) | ASIC (synthesis) | XCZU9EG (ZCU102) | XCVU9P |
+| Array Size | 8×8 PE | 8×8 MAC | 1024 OPs | 16×16 PE |
+| Precisions | **7** (INT4–FP64) | INT8/INT16/FP16 | INT8 only | INT8/FP16 |
+| Mixed-Precision | **3 modes** | None | None | None |
+| Sparse Accel. | **3 modes** | None | None | None |
+| Fmax | **214.6 MHz** | — | 330 MHz | 200 MHz |
+| LUT Utilization | 7.84% | — | ~70% | ~15% |
+| DSP Usage | **0** (pure LUT) | — | Heavy | Heavy |
+| Energy Eff. | 3.36 GOPS/W (sim) | ~5 TOPS/W (ASIC) | 2.37 TOPS/W | — |
+| Runtime Precision Switch | **Zero-overhead** | Reconfigure | Not supported | Not supported |
+
+> **Positioning**: NVDLA is an ASIC reference design with inherent process-level efficiency advantages. Xilinx DPU targets deployment with heavy DSP utilization. This work emphasizes **precision flexibility** (7 precisions + 3 mixed modes), **sparse acceleration** (3 modes), and **zero DSP usage**, making it ideal for heterogeneous FPGA resource sharing.
+
+---
+
+## Quick Preview
+
+> See full document: [`答辩材料/CICC0900784 中科芯杯 快速预览页.pdf`](答辩材料/CICC0900784%20中科芯杯%20快速预览页.pdf)
+
+### Implemented Features
+
+- **3 Matrix Dimensions**: m16n16k16, m32n8k16, m8n32k16 GEMM operations
+- **7 Precisions**: INT4, INT8, INT32, FP16, FP32, FP64, BF16
+- **Hardware Reuse**: 8×8 PE array; multi-precision shared MAC units; FP16/FP32 shared floating-point multiplier
+- **3 Mixed-Precision Modes**: INT4/INT8 + INT32; FP16 + FP32 + FP64; BF16 + FP32 (includes data precision and mixed computation mode extensions)
+- **Overflow Handling**: Conforms to IEEE integer/floating-point arithmetic standards; supports denormal number processing
+- **Sparse Acceleration**: 4:2 structured sparsity (Fmax 206.53 MHz, LUT 7%, power 2.798 W, dynamic power reduced to 1/4)
+- **Joint Optimization**: Tile-wise sparsity & weight pruning + FP32→BF16 quantization, dynamic power reduced to **0.276 W**
+
+### Performance at a Glance
+
+| Category | Metric |
+|----------|--------|
+| Synthesis Frequency | **214.6 MHz** |
+| Area | LUT 8%, FF 2%, IO 22% |
+| Power | Total 3.663 W (Dynamic 1.177 W, Static 2.486 W) |
+| Memory Bandwidth | 3.2 GB/s |
+| Throughput | Theoretical: **27.47 GOPS**; Simulated: **12.3 GOPS** |
+| Energy Efficiency | Theoretical: 7.50 GOPS/W; Simulated: 3.36 GOPS/W |
+| Compute Latency | **163.1 ns** |
+
+---
+
+## Directory Structure
 
 ```
 .
-├── README.md
-├── 获奖证书/
+├── README.md                    # English README (this file)
+├── README_CN.md                 # Chinese README
+├── 获奖证书/                     # Award Certificate
 │   └── 集创赛 获奖证书.jpg
 │
-├── 答辩材料/
-│   ├── CICC0900784 中科芯杯 分赛区决赛PPT汇报.pptx    # 答辩PPT
-│   ├── CICC0900784 中科芯杯 分赛区决赛技术文档.docx    # 技术文档 (Word)
-│   ├── CICC0900784 中科芯杯 分赛区决赛技术文档.pdf     # 技术文档 (PDF)
-│   ├── CICC0900784 中科芯杯 快速预览页.docx            # 快速预览页
+├── 答辩材料/                     # Defense Materials
+│   ├── CICC0900784 中科芯杯 分赛区决赛PPT汇报.pptx    # Defense slides
+│   ├── CICC0900784 中科芯杯 分赛区决赛技术文档.docx    # Technical document (Word)
+│   ├── CICC0900784 中科芯杯 分赛区决赛技术文档.pdf     # Technical document (PDF)
+│   ├── CICC0900784 中科芯杯 快速预览页.docx            # Quick preview page
 │   ├── CICC0900784 中科芯杯 快速预览页.pdf
-│   ├── CICC0900784 中科芯杯 海报展示.png               # 展示海报
-│   ├── 32×32＋16×16＋8×8分块PE阵列仿真测试结果.docx    # 仿真结果
+│   ├── CICC0900784 中科芯杯 海报展示.png               # Exhibition poster
+│   ├── 32×32＋16×16＋8×8分块PE阵列仿真测试结果.docx    # Simulation results
 │   └── 复活赛.docx
 │
-├── 源代码/
-│   ├── 复赛提交包/
-│   │   ├── CICC0900784 中科芯杯 SystemVerilog源码.zip  # 提交压缩包
-│   │   └── CICC0900784 中科芯杯 SystemVerilog源码/     # Vivado 工程
-│   │       ├── Sparse_Matrix.srcs/                     # 稀疏矩阵模块
-│   │       │   ├── sources_1/new/                      # RTL 源码
-│   │       │   │   ├── sparse_matrix.sv                #   基础稀疏矩阵 TPU
-│   │       │   │   ├── sparse_matrix_4×4.sv            #   4×4 PE 阵列版本
-│   │       │   │   ├── Pruning.sv                      #   结构化剪枝版本
-│   │       │   │   └── Tile_wise.sv                    #   分块稀疏版本
-│   │       │   ├── sim_1/new/                          # 仿真 Testbench
-│   │       │   ├── constrs_1/new/                      # 时序约束 (7ns)
-│   │       │   └── utils_1/                            # 综合检查点 (.dcp)
-│   │       ├── TPU_Defense_Presentation.srcs/          # 答辩演示版本
-│   │       └── 最终提交代码 完整tb/                     # 最终提交版本
-│   │           ├── TOP_TPU_new.sv                      #   顶层模块
-│   │           └── tb/                                 #   完整 Testbench 集
-│   ├── 独立模块/
-│   │   ├── fp32.sv                  # FP32 PE 测试模块
-│   │   ├── fp32_add.sv              # FP32 浮点加法器
-│   │   ├── fp32_mul.sv              # FP32 浮点乘法器
-│   │   ├── tb_fp32_add.sv           # FP32 加法器 Testbench
-│   │   ├── tb_fp32_mul.sv           # FP32 乘法器 Testbench
-│   │   ├── compute测试通过.sv        # 计算单元验证
-│   │   ├── fp32 PE测试.sv           # PE 单元验证
-│   │   ├── tb_int4_m8n32k16.sv      # INT4 矩阵测试
-│   │   └── hex.py                   # 测试数据生成脚本
+├── 源代码/                       # Source Code
+│   ├── 复赛提交包/               # Competition Submission
+│   │   ├── CICC0900784 中科芯杯 SystemVerilog源码.zip  # Submission archive
+│   │   └── CICC0900784 中科芯杯 SystemVerilog源码/     # Vivado project
+│   │       ├── Sparse_Matrix.srcs/                     # Sparse matrix modules
+│   │       │   ├── sources_1/new/                      # RTL sources
+│   │       │   │   ├── sparse_matrix.sv                #   Basic sparse TPU
+│   │       │   │   ├── sparse_matrix_4×4.sv            #   4×4 PE array variant
+│   │       │   │   ├── Pruning.sv                      #   Structured pruning variant
+│   │       │   │   └── Tile_wise.sv                    #   Tile-wise sparse variant
+│   │       │   ├── sim_1/new/                          # Simulation testbenches
+│   │       │   ├── constrs_1/new/                      # Timing constraints (7ns)
+│   │       │   └── utils_1/                            # Synthesis checkpoints (.dcp)
+│   │       ├── TPU_Defense_Presentation.srcs/          # Defense demo version
+│   │       └── 最终提交代码 完整tb/                     # Final submission
+│   │           ├── TOP_TPU_new.sv                      #   Top-level module
+│   │           └── tb/                                 #   Complete testbench suite
+│   ├── 独立模块/                 # Standalone Modules
+│   │   ├── fp32.sv                  # FP32 PE test module
+│   │   ├── fp32_add.sv              # FP32 floating-point adder
+│   │   ├── fp32_mul.sv              # FP32 floating-point multiplier
+│   │   ├── tb_fp32_add.sv           # FP32 adder testbench
+│   │   ├── tb_fp32_mul.sv           # FP32 multiplier testbench
+│   │   ├── compute测试通过.sv        # Compute unit verification
+│   │   ├── fp32 PE测试.sv           # PE unit verification
+│   │   ├── tb_int4_m8n32k16.sv      # INT4 matrix test
+│   │   └── hex.py                   # Test data generation script
 │   └── Testbench/
-│       ├── data_load_tb/            # 数据加载模块 Testbench
-│       └── for_pre_tb/              # 答辩演示 Testbench (全精度覆盖)
+│       ├── data_load_tb/            # Data load module testbenches
+│       └── for_pre_tb/              # Defense demo testbenches (all precisions)
 │
-└── 测试数据/
-    ├── testcase/                    # 完整测试向量集
-    │   ├── fp16/                    #   FP16 测试数据
-    │   ├── fp32/                    #   FP32 测试数据 (含稀疏矩阵/剪枝/分块)
-    │   ├── int4/                    #   INT4 测试数据
-    │   ├── int4_int32/              #   INT4输入+INT32累加 测试数据
-    │   ├── int8/                    #   INT8 测试数据
-    │   ├── int8_int32/              #   INT8输入+INT32累加 测试数据
-    │   └── FP32sparse_matrix/       #   FP32 稀疏矩阵专用测试数据
-    ├── bf16_m8n32k16/               # BF16 测试数据
-    ├── fp16_m8n32k16/               # FP16 测试数据 (含期望结果)
-    ├── fp32/                        # FP32 测试数据 (含 bin/dec 格式)
-    ├── INT4sparse_matrix/           # INT4 稀疏矩阵测试数据
-    └── *.mem                        # 基础测试向量
+└── 测试数据/                     # Test Data
+    ├── testcase/                    # Complete test vector set
+    │   ├── fp16/                    #   FP16 test data
+    │   ├── fp32/                    #   FP32 test data (incl. sparse/pruning/tile-wise)
+    │   ├── int4/                    #   INT4 test data
+    │   ├── int4_int32/              #   INT4 input + INT32 accumulation test data
+    │   ├── int8/                    #   INT8 test data
+    │   ├── int8_int32/              #   INT8 input + INT32 accumulation test data
+    │   └── FP32sparse_matrix/       #   FP32 sparse matrix test data
+    ├── bf16_m8n32k16/               # BF16 test data
+    ├── fp16_m8n32k16/               # FP16 test data (with expected results)
+    ├── fp32/                        # FP32 test data (bin/dec formats)
+    ├── INT4sparse_matrix/           # INT4 sparse matrix test data
+    └── *.mem                        # Basic test vectors
 ```
 
-## 仿真与验证
+---
 
-### 环境要求
+## Verification
 
-- Xilinx Vivado 2024.1 或更高版本
-- 目标器件：XCVU9P-L2FLGA2104E (VCU118)
+### Environment Requirements
 
-### 测试覆盖
+- Xilinx Vivado 2024.1 or later
+- Target device: XCVU9P-L2FLGA2104E (VCU118)
 
-| 测试类别 | Testbench 数量 | 覆盖内容 |
-|----------|---------------|---------|
-| 全精度 GEMM | 15 | FP32/FP16/BF16/INT8/INT4 × 3种矩阵维度 |
-| 混合精度 | 4 | INT4→INT32, INT8→INT32 累加 |
-| 稀疏加速 | 5 | Basic/Pruning/Tile-wise × 多稀疏度 |
-| 组件级 | 4 | FP32 加法器、乘法器、PE 单元、数据加载 |
-| **合计** | **28** | 全精度 × 全维度 × 全模式覆盖 |
+### Test Coverage
 
-### 运行步骤
+| Category | Testbenches | Coverage |
+|----------|------------|---------|
+| Full-Precision GEMM | 15 | FP32/FP16/BF16/INT8/INT4 × 3 matrix dimensions |
+| Mixed-Precision | 4 | INT4→INT32, INT8→INT32 accumulation |
+| Sparse Acceleration | 5 | Basic/Pruning/Tile-wise × multiple sparsity levels |
+| Component-Level | 4 | FP32 adder, multiplier, PE unit, data loader |
+| **Total** | **28** | Full precision × dimension × mode coverage |
 
-1. 在 Vivado 中打开工程（`源代码/复赛提交包/` 下的 `.srcs` 目录）
-2. 将对应精度的测试数据（`测试数据/testcase/`）加载到仿真路径
-3. 选择对应的 Testbench 运行行为仿真
-4. 验证输出矩阵 D 与期望结果匹配
+### Running Simulations
 
-### 测试数据格式
+1. Open the Vivado project (`.srcs` directories under `源代码/复赛提交包/`)
+2. Load test vectors from `测试数据/testcase/` for the target precision
+3. Select the appropriate testbench and run behavioral simulation
+4. Verify output matrix $D$ matches expected results
 
-文件命名规则：`{矩阵}_{精度}_{维度}.mem.txt`
+### Test Data Format
 
-- `a_` — 输入矩阵 A
-- `b_` — 输入矩阵 B
-- `c_` — 偏置矩阵 C
-- `d_` — 期望输出矩阵 D
+File naming: `{matrix}_{precision}_{dimension}.mem.txt`
+
+- `a_` — Input matrix A
+- `b_` — Input matrix B
+- `c_` — Bias matrix C
+- `d_` — Expected output matrix D
 
 ---
 
-## 快速预览
+## Limitations & Future Work
 
-> 详见 [`答辩材料/CICC0900784 中科芯杯 快速预览页.pdf`](答辩材料/CICC0900784%20中科芯杯%20快速预览页.pdf)
-
-### 实现功能
-
-- **3 种维度**：支持 m16n16k16、m32n8k16、m8n32k16 三种矩阵维度乘加运算
-- **7 种精度**：支持 INT4、INT8、INT32、FP16、FP32、FP64、BF16 格式运算
-- **硬件资源复用**：8×8 PE 阵列；PE 多精度共用乘加法器；FP16、FP32 共用浮点乘法单元
-- **3 种混合精度**：INT4/INT8 + INT32；FP16 + FP32 + FP64；BF16 + FP32（包含数据精度、混合计算模式扩展）
-- **溢出处理**：参考 IEEE 整数、浮点数算数标准；支持非规格数处理
-- **稀疏加速**：4:2 结构化稀疏（综合频率 206.53MHz，LUT 7%，功耗 2.798W，动态功耗缩减为原来 1/4）
-- **联合优化**：Tile-wise 稀疏 & 权重剪枝 + FP32 转 BF16 量化，动态功耗降低至 **0.276W**
-
-### 性能指标速览
-
-| 类别 | 指标 |
-|------|------|
-| 综合频率 | **214.6 MHz** |
-| 面积 | LUT 使用率 8%、FF 使用率 2%、IO 使用率 22% |
-| 功耗 | 总功耗 3.663W（动态功耗 1.177W、静态功耗 2.486W） |
-| 存储带宽 | 3.2 GB/s |
-| 算力 | 理论算力：**27.47 GOPS**；实际算力：**12.3 GOPS** |
-| 能效比 | 理论能效比：7.50 GOPS/W；仿真能效比：3.36 GOPS/W |
-| 计算延迟 | **163.1 ns** |
-
-### 项目不足及改进方向
-
-时序裕度余量较少（WNS = 0.34 ns），可能不能稳定工作在 200MHz 时钟频率下。未来将把工作重心放在优化时序性能以及提升能效比上，以及做上板实物验证测试。
+- **Timing margin**: WNS = 0.34 ns provides limited margin; sustained operation at 200 MHz may require further optimization.
+- **On-board verification**: Current results are post-implementation simulation only. Future work includes bitstream deployment on VCU118 with ILA waveform capture for physical validation.
+- **Energy efficiency**: Optimizing the critical path (FP32 multiply → alignment) and exploring DSP-LUT hybrid arithmetic could improve both Fmax and energy efficiency.
 
 ---
 
-## 与同类设计对比
-
-| 指标 | **本设计 (Ours)** | NVDLA Small [5] | Xilinx DPU (B1024) [6] | Genc et al. [7] |
-|------|-------------------|-----------------|------------------------|-----------------|
-| 平台 | XCVU9P (VCU118) | ASIC (合成) | XCZU9EG (ZCU102) | XCVU9P |
-| 阵列规模 | 8×8 PE | 8×8 MAC | 1024 OPs | 16×16 PE |
-| 精度支持 | **7 种** (INT4~FP64) | INT8/INT16/FP16 | INT8 only | INT8/FP16 |
-| 混合精度 | **3 种模式** | 无 | 无 | 无 |
-| 稀疏加速 | **3 种模式** | 无 | 无 | 无 |
-| Fmax | **214.6 MHz** | — | 330 MHz | 200 MHz |
-| LUT 利用率 | 7.84% | — | ~70% | ~15% |
-| DSP 使用 | **0** (纯 LUT) | — | 大量 | 大量 |
-| 能效比 | 3.36 GOPS/W (仿真) | ~5 TOPS/W (ASIC) | 2.37 TOPS/W | — |
-| 动态精度切换 | **运行时零开销** | 需重新配置 | 不支持 | 不支持 |
-
-> **定位差异**：NVDLA 为 ASIC 参考设计，能效比优势来自工艺；Xilinx DPU 面向部署，大量使用 DSP 资源。本设计强调**精度灵活性**（7 种精度 + 3 种混合模式）和**稀疏加速**（3 种模式），且 **DSP 零占用**，适合与其他加速核共享 FPGA 资源。
-
----
-
-## 参考文献
+## References
 
 1. IEEE Std 754-2019, *IEEE Standard for Floating-Point Arithmetic*, IEEE, 2019.
 2. Google Brain, "BFloat16: The secret to high performance on Cloud TPUs," 2019.
@@ -541,7 +533,7 @@ $$\text{Speedup}_{\text{actual}} = \frac{T_{\text{load}} + T_{\text{compute}}}{T
 
 ---
 
-## 获奖证书
+## Award
 
 <p align="center">
   <img src="获奖证书/集创赛 获奖证书.jpg" width="600">
@@ -551,4 +543,4 @@ $$\text{Speedup}_{\text{actual}} = \frac{T_{\text{load}} + T_{\text{compute}}}{T
 
 ## License
 
-本项目为竞赛作品，仅供学习交流使用。
+This project is a competition entry intended for academic and educational purposes only.
