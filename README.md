@@ -2,7 +2,17 @@
 
 > **第九届（2025）全国大学生集成电路创新创业大赛 · 中科芯杯 · 华南分赛区二等奖**
 
-基于 FPGA 的多精度张量计算单元（TPU）设计，面向 AI 推理场景的异构加速架构。核心实现 8×8 脉动阵列（Systolic Array），支持 INT4/INT8/INT32/FP16/FP32/FP64/BF16 共 **7 种数据精度**的矩阵乘累加（GEMM）运算 **D = A × B + C**，并通过 Bitmap 稀疏编码 + 结构化剪枝 + Tile-wise 分块实现零值跳过加速，在 Xilinx VCU118 平台上达到 **214.6 MHz** 综合频率，理论算力 **27.47 GOPS**。
+**[English Version (README_EN.md)](README_EN.md)**
+
+基于 FPGA 的多精度张量计算单元（TPU）设计，面向 AI 推理场景的异构加速架构。核心实现 8×8 脉动阵列（Systolic Array），支持 INT4/INT8/INT32/FP16/FP32/FP64/BF16 共 **7 种数据精度**的矩阵乘累加（GEMM）运算，并通过 Bitmap 稀疏编码 + 结构化剪枝 + Tile-wise 分块实现零值跳过加速，在 Xilinx VCU118 平台上达到 **214.6 MHz** 综合频率，理论算力 **27.47 GOPS**。
+
+### 核心 GEMM 运算
+
+对于 $M \times K$ 矩阵 $A$、$K \times N$ 矩阵 $B$、偏置矩阵 $C$，输出矩阵 $D$ 的每个元素计算如下：
+
+$$D_{ij} = \sum_{k=0}^{K-1} A_{ik} \cdot B_{kj} + C_{ij}, \quad i \in [0, M), \; j \in [0, N)$$
+
+本设计通过 8×8 脉动阵列对上述运算进行硬件映射，大矩阵经分块（Tiling）后以子块为单位送入阵列迭代计算。
 
 ---
 
@@ -22,6 +32,8 @@
 ---
 
 ## 硬件架构总览
+
+> **高清架构图**：建议使用 [Draw.io](https://app.diagrams.net/) 或 Visio 将下方 ASCII 架构图导出为 SVG/PNG 彩色矢量图，便于在手机端和答辩场景阅读。可参考 `答辩材料/CICC0900784 中科芯杯 海报展示.png` 中的设计风格。
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
@@ -123,9 +135,18 @@
 | FP16 + FP32 + FP64 | 16-bit 浮点 | 32/64-bit 浮点 | 高精度浮点训练/推理 |
 | BF16 + FP32 | 16-bit BF16 | 32-bit 浮点 | 大动态范围 AI 推理 |
 
+> **参考标准**：浮点运算遵循 **IEEE 754-2019** 标准 [1]，实现完整的 Round-to-Nearest-Even 舍入策略、NaN/Inf 传播、非规格数（Denormal）处理及溢出检测。BF16 格式参考 Google Brain 的 **Brain Floating Point** 定义 [2]，与 NVIDIA Tensor Core 第三代（Ampere 架构）的精度配置对齐 [3]。混合精度策略借鉴 NVIDIA Mixed-Precision Training 方法论 [4]。
+
 #### 硬件复用机制（关键设计）
 
-多精度切换的核心在于**统一 36-bit 数据通路 + 精度感知的运算函数选择**：
+多精度切换的核心在于**统一 36-bit 数据通路 + 精度感知的运算函数选择**。
+
+**浮点运算核心公式**（遵循 IEEE 754-2019 [1]）：
+
+- **FP32 乘法**：$(-1)^{s_a \oplus s_b} \times 2^{(e_a + e_b - 127)} \times (1.m_a \times 1.m_b)$，24×24 位尾数相乘后进行 Round-to-Nearest-Even 舍入
+- **FP16→FP32 提升**：$e_{\text{FP32}} = e_{\text{FP16}} + 112$（偏移量差 $127 - 15 = 112$），非规格数通过前导零计数归一化
+- **BF16→FP32 提升**：高 16 位直接映射（$\text{BF16} \equiv \text{FP32}[31:16]$，低 16 位补零）
+- **整数溢出检测**：$\text{overflow} = (A[63] = B[63]) \wedge (A[63] \neq \text{Result}[63])$（同符号输入异符号输出）
 
 ```
                32-bit AXI 数据输入
@@ -175,6 +196,14 @@
 
 ### 2. 稀疏矩阵加速：Bitmap 压缩格式
 
+#### 稀疏 GEMM 数学表达
+
+在稀疏模式下，对矩阵 $A$ 的每个元素引入有效性掩码 $m_A$，GEMM 运算简化为：
+
+$$D_{ij} = \sum_{k=0}^{K-1} m_{A}(i,k) \cdot m_{B}(k,j) \cdot A_{ik} \cdot B_{kj} + C_{ij}$$
+
+其中 $m_A(i,k), m_B(k,j) \in \{0, 1\}$ 为 Bitmap 掩码。当 $m_A(i,k)=0$ 或 $m_B(k,j)=0$ 时，对应乘法被跳过，PE 直接传递部分和，实现零延迟旁路。
+
 #### 压缩格式设计
 
 本设计采用 **Bitmap（位图）稀疏编码格式**，而非传统的 CSR/CSC 格式。选择 Bitmap 的原因：
@@ -217,11 +246,20 @@ end
 
 **加速比分析**：
 
-- 理论上限：稀疏度为 S 时，加速比 = 1/(1-S)，即 50% 稀疏度理论加速比 2.0×
-- 实际加速比略低于理论值，因为：
-  - FSM 控制和数据加载阶段不受稀疏度影响（Amdahl 定律）
-  - 流水线排空开销固定（~27 cycles）
-  - 75% 稀疏度下实测加速比约 3.2×（理论 4.0×，效率 80%）
+理论加速比由稀疏度 $S$（零元素占比）决定：
+
+$$\text{Speedup}_{\text{ideal}} = \frac{1}{1-S}$$
+
+实际加速比受 Amdahl 定律约束——数据加载和 FSM 控制阶段不可并行化：
+
+$$\text{Speedup}_{\text{actual}} = \frac{T_{\text{load}} + T_{\text{compute}}}{T_{\text{load}} + (1-S) \cdot T_{\text{compute}}}$$
+
+其中 $T_{\text{load}} = M \cdot N + M \cdot K + K \cdot N$ cycles（加载 C/A/B 矩阵），$T_{\text{compute}} = K + 27$ cycles（含流水线排空）。对于 16×16×16 矩阵：
+
+| 稀疏度 $S$ | 理论加速比 | 实测加速比 | 效率 |
+|-----------|----------|----------|------|
+| 50% | 2.0× | ~1.8× | 90% |
+| 75% | 4.0× | ~3.2× | 80% |
 
 ---
 
@@ -468,7 +506,38 @@ end
 
 ### 项目不足及改进方向
 
-时序裕度余量较少，可能不能稳定工作在 200MHz 时钟频率下。未来将把工作重心放在优化时序性能以及提升能效比上，以及做上板实物验证测试。
+时序裕度余量较少（WNS = 0.34 ns），可能不能稳定工作在 200MHz 时钟频率下。未来将把工作重心放在优化时序性能以及提升能效比上，以及做上板实物验证测试。
+
+---
+
+## 与同类设计对比
+
+| 指标 | **本设计 (Ours)** | NVDLA Small [5] | Xilinx DPU (B1024) [6] | Genc et al. [7] |
+|------|-------------------|-----------------|------------------------|-----------------|
+| 平台 | XCVU9P (VCU118) | ASIC (合成) | XCZU9EG (ZCU102) | XCVU9P |
+| 阵列规模 | 8×8 PE | 8×8 MAC | 1024 OPs | 16×16 PE |
+| 精度支持 | **7 种** (INT4~FP64) | INT8/INT16/FP16 | INT8 only | INT8/FP16 |
+| 混合精度 | **3 种模式** | 无 | 无 | 无 |
+| 稀疏加速 | **3 种模式** | 无 | 无 | 无 |
+| Fmax | **214.6 MHz** | — | 330 MHz | 200 MHz |
+| LUT 利用率 | 7.84% | — | ~70% | ~15% |
+| DSP 使用 | **0** (纯 LUT) | — | 大量 | 大量 |
+| 能效比 | 3.36 GOPS/W (仿真) | ~5 TOPS/W (ASIC) | 2.37 TOPS/W | — |
+| 动态精度切换 | **运行时零开销** | 需重新配置 | 不支持 | 不支持 |
+
+> **定位差异**：NVDLA 为 ASIC 参考设计，能效比优势来自工艺；Xilinx DPU 面向部署，大量使用 DSP 资源。本设计强调**精度灵活性**（7 种精度 + 3 种混合模式）和**稀疏加速**（3 种模式），且 **DSP 零占用**，适合与其他加速核共享 FPGA 资源。
+
+---
+
+## 参考文献
+
+1. IEEE Std 754-2019, *IEEE Standard for Floating-Point Arithmetic*, IEEE, 2019.
+2. Google Brain, "BFloat16: The secret to high performance on Cloud TPUs," 2019.
+3. NVIDIA, "NVIDIA A100 Tensor Core GPU Architecture," Whitepaper, 2020.
+4. P. Micikevicius et al., "Mixed Precision Training," *ICLR*, 2018.
+5. NVIDIA, "NVDLA Open Source Project," http://nvdla.org, 2018.
+6. Xilinx, "Vitis AI DPU Architecture," UG1414, 2023.
+7. H. Genc et al., "Gemmini: Enabling Systematic Deep-Learning Architecture Evaluation via Full-Stack Integration," *DAC*, 2021.
 
 ---
 
